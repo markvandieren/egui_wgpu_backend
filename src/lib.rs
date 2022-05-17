@@ -267,7 +267,7 @@ impl RenderPass {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         color_attachment: &wgpu::TextureView,
-        paint_jobs: &[egui::epaint::ClippedMesh],
+        paint_jobs: &[egui::epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
         clear_color: Option<wgpu::Color>,
     ) -> Result<(), BackendError> {
@@ -302,7 +302,7 @@ impl RenderPass {
     pub fn execute_with_renderpass<'rpass>(
         &'rpass self,
         rpass: &mut wgpu::RenderPass<'rpass>,
-        paint_jobs: &[egui::epaint::ClippedMesh],
+        paint_jobs: &[egui::epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
     ) -> Result<(), BackendError> {
         rpass.set_pipeline(&self.render_pipeline);
@@ -313,7 +313,16 @@ impl RenderPass {
         let physical_width = screen_descriptor.physical_width;
         let physical_height = screen_descriptor.physical_height;
 
-        for ((egui::ClippedMesh(clip_rect, mesh), vertex_buffer), index_buffer) in paint_jobs
+        for (
+            (
+                egui::ClippedPrimitive {
+                    clip_rect,
+                    primitive,
+                },
+                vertex_buffer,
+            ),
+            index_buffer,
+        ) in paint_jobs
             .iter()
             .zip(self.vertex_buffers.iter())
             .zip(self.index_buffers.iter())
@@ -352,12 +361,16 @@ impl RenderPass {
 
                 rpass.set_scissor_rect(x, y, width, height);
             }
-            let bind_group = self.get_texture_bind_group(mesh.texture_id)?;
-            rpass.set_bind_group(1, bind_group, &[]);
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive {
+                let bind_group = self.get_texture_bind_group(mesh.texture_id)?;
+                rpass.set_bind_group(1, bind_group, &[]);
 
-            rpass.set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.set_vertex_buffer(0, vertex_buffer.buffer.slice(..));
-            rpass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+                rpass.set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.set_vertex_buffer(0, vertex_buffer.buffer.slice(..));
+                rpass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+            } else {
+                unimplemented!()
+            }
         }
 
         Ok(())
@@ -396,12 +409,12 @@ impl RenderPass {
 
             let alpha_srgb_pixels: Option<Vec<_>> = match &image_delta.image {
                 egui::ImageData::Color(_) => None,
-                egui::ImageData::Alpha(a) => Some(a.srgba_pixels(1.0).collect()),
+                egui::ImageData::Font(a) => Some(a.srgba_pixels(1.0).collect()),
             };
 
             let image_data: &[u8] = match &image_delta.image {
                 egui::ImageData::Color(c) => bytemuck::cast_slice(c.pixels.as_slice()),
-                egui::ImageData::Alpha(_) => {
+                egui::ImageData::Font(_) => {
                     // The unwrap here should never fail as alpha_srgb_pixels will have been set to
                     // `Some` above.
                     bytemuck::cast_slice(
@@ -430,7 +443,7 @@ impl RenderPass {
                 egui::TextureId::User(u) => format!("egui_user_image_{}", u),
             };
 
-            match self.textures.entry(texture_id.clone()) {
+            match self.textures.entry(*texture_id) {
                 Entry::Occupied(mut o) => match image_delta.pos {
                     None => {
                         let (texture, bind_group) = create_texture_and_bind_group(
@@ -676,7 +689,7 @@ impl RenderPass {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        paint_jobs: &[egui::epaint::ClippedMesh],
+        paint_jobs: &[egui::epaint::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
     ) {
         let index_size = self.index_buffers.len();
@@ -695,36 +708,40 @@ impl RenderPass {
             }]),
         );
 
-        for (i, egui::ClippedMesh(_, mesh)) in paint_jobs.iter().enumerate() {
-            let data: &[u8] = bytemuck::cast_slice(&mesh.indices);
-            if i < index_size {
-                self.update_buffer(device, queue, BufferType::Index, i, data)
-            } else {
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("egui_index_buffer"),
-                    contents: data,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                });
-                self.index_buffers.push(SizedBuffer {
-                    buffer,
-                    size: data.len(),
-                });
-            }
+        for (i, egui::ClippedPrimitive { primitive, .. }) in paint_jobs.iter().enumerate() {
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive {
+                let data: &[u8] = bytemuck::cast_slice(&mesh.indices);
+                if i < index_size {
+                    self.update_buffer(device, queue, BufferType::Index, i, data)
+                } else {
+                    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("egui_index_buffer"),
+                        contents: data,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    });
+                    self.index_buffers.push(SizedBuffer {
+                        buffer,
+                        size: data.len(),
+                    });
+                }
 
-            let data: &[u8] = bytemuck::cast_slice(&mesh.vertices);
-            if i < vertex_size {
-                self.update_buffer(device, queue, BufferType::Vertex, i, data)
-            } else {
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("egui_vertex_buffer"),
-                    contents: data,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
+                let data: &[u8] = bytemuck::cast_slice(&mesh.vertices);
+                if i < vertex_size {
+                    self.update_buffer(device, queue, BufferType::Vertex, i, data)
+                } else {
+                    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("egui_vertex_buffer"),
+                        contents: data,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
 
-                self.vertex_buffers.push(SizedBuffer {
-                    buffer,
-                    size: data.len(),
-                });
+                    self.vertex_buffers.push(SizedBuffer {
+                        buffer,
+                        size: data.len(),
+                    });
+                }
+            } else {
+                unimplemented!()
             }
         }
     }
@@ -811,7 +828,7 @@ fn create_texture_and_bind_group(
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(format!("{}_texture_bind_group", label_base).as_str()),
-        layout: &texture_bind_group_layout,
+        layout: texture_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
